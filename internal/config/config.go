@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -39,6 +40,11 @@ type APIConfig struct {
 	BrokerMetricsURL string
 	DefaultTokenTTL  time.Duration
 	CommandQoS       int
+	ReadTimeout      time.Duration
+	WriteTimeout     time.Duration
+	IdleTimeout      time.Duration
+	RequestTimeout   time.Duration
+	MaxBodyBytes     int64
 }
 
 type AuthConfig struct {
@@ -84,6 +90,11 @@ func Load() Config {
 			BrokerMetricsURL: env("CRABMQ_BROKER_METRICS_URL", "http://127.0.0.1:9100/metrics"),
 			DefaultTokenTTL:  envDuration("CRABMQ_DEFAULT_TOKEN_TTL", 12*time.Hour),
 			CommandQoS:       envInt("CRABMQ_COMMAND_QOS", 1),
+			ReadTimeout:      envDuration("CRABMQ_API_READ_TIMEOUT", 10*time.Second),
+			WriteTimeout:     envDuration("CRABMQ_API_WRITE_TIMEOUT", 15*time.Second),
+			IdleTimeout:      envDuration("CRABMQ_API_IDLE_TIMEOUT", 60*time.Second),
+			RequestTimeout:   envDuration("CRABMQ_API_REQUEST_TIMEOUT", 10*time.Second),
+			MaxBodyBytes:     envInt64("CRABMQ_API_MAX_BODY_BYTES", 1<<20),
 		},
 		Auth: AuthConfig{
 			JWTSecret:      env("CRABMQ_JWT_SECRET", "change-me"),
@@ -103,6 +114,65 @@ func Load() Config {
 	}
 }
 
+func (c Config) Validate() error {
+	issues := make([]string, 0)
+
+	if c.Auth.JWTSecret == "" {
+		issues = append(issues, "CRABMQ_JWT_SECRET must not be empty")
+	}
+	if c.Env == "production" && c.Auth.JWTSecret == "change-me" {
+		issues = append(issues, "CRABMQ_JWT_SECRET must be changed for production")
+	}
+	if c.Auth.AdminTokenTTL <= 0 {
+		issues = append(issues, "CRABMQ_ADMIN_TOKEN_TTL must be greater than zero")
+	}
+	if c.Auth.DeviceTokenTTL <= 0 {
+		issues = append(issues, "CRABMQ_DEVICE_TOKEN_TTL must be greater than zero")
+	}
+	if c.API.DefaultTokenTTL <= 0 {
+		issues = append(issues, "CRABMQ_DEFAULT_TOKEN_TTL must be greater than zero")
+	}
+	if c.API.CommandQoS < 0 || c.API.CommandQoS > 1 {
+		issues = append(issues, "CRABMQ_COMMAND_QOS must be 0 or 1")
+	}
+	if len(c.API.AllowedOrigins) == 0 {
+		issues = append(issues, "CRABMQ_ALLOWED_ORIGINS must include at least one origin")
+	}
+	if c.API.RequestTimeout <= 0 {
+		issues = append(issues, "CRABMQ_API_REQUEST_TIMEOUT must be greater than zero")
+	}
+	if c.API.ReadTimeout <= 0 || c.API.WriteTimeout <= 0 || c.API.IdleTimeout <= 0 {
+		issues = append(issues, "API timeouts must be greater than zero")
+	}
+	if c.API.MaxBodyBytes <= 0 {
+		issues = append(issues, "CRABMQ_API_MAX_BODY_BYTES must be greater than zero")
+	}
+	if c.Broker.MaxClients <= 0 {
+		issues = append(issues, "CRABMQ_MAX_CLIENTS must be greater than zero")
+	}
+	if c.Broker.RateLimitPerMin <= 0 {
+		issues = append(issues, "CRABMQ_RATE_LIMIT_PER_MIN must be greater than zero")
+	}
+	if c.Broker.OfflineQueueTTL <= 0 {
+		issues = append(issues, "CRABMQ_OFFLINE_QUEUE_TTL must be greater than zero")
+	}
+	if c.Broker.ReadTimeout <= 0 || c.Broker.WriteTimeout <= 0 {
+		issues = append(issues, "broker timeouts must be greater than zero")
+	}
+	if c.Simulator.DeviceCount <= 0 {
+		issues = append(issues, "CRABMQ_SIM_DEVICE_COUNT must be greater than zero")
+	}
+	if c.Simulator.PublishInterval <= 0 {
+		issues = append(issues, "CRABMQ_SIM_INTERVAL must be greater than zero")
+	}
+
+	if len(issues) == 0 {
+		return nil
+	}
+
+	return errors.New(strings.Join(issues, "; "))
+}
+
 func env(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -118,6 +188,20 @@ func envInt(key string, fallback int) int {
 	}
 
 	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+
+	return value
+}
+
+func envInt64(key string, fallback int64) int64 {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+
+	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
 		return fallback
 	}
