@@ -1,20 +1,36 @@
-name: Docker CI
+name: Docker
 
 on:
   push:
-    branches: [main]
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
 
 jobs:
-  docker:
+  build-images:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: broker
+            dockerfile: deployments/broker.Dockerfile
+          - name: api
+            dockerfile: deployments/api.Dockerfile
+          - name: dashboard
+            dockerfile: deployments/dashboard.Dockerfile
+          - name: sim
+            dockerfile: deployments/sim.Dockerfile
     steps:
-      - uses: actions/checkout@v3
-      - name: Build Docker image
-        run: docker build -t opencorex/crabmq:latest .
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.name }} image
+        uses: docker/build-push-action@v6
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-      - name: Push Docker image
-        run: docker push opencorex/crabmq:latest
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: crabmq/${{ matrix.name }}:ci
