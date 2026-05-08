@@ -10,6 +10,7 @@ target
 *.pdb
 
 .cache/
+.pnpm-store/
 web/dashboard/node_modules/
 web/dashboard/dist/
 *.tsbuildinfo
