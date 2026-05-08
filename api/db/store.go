@@ -78,6 +78,10 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+func (s *Store) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
 func (s *Store) EnsureSchema(ctx context.Context) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS devices (
