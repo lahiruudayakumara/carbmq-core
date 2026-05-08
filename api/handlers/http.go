@@ -1,12 +1,13 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ type Server struct {
 	bridge  *services.Bridge
 	logger  *slog.Logger
 	server  *http.Server
+	client  *http.Client
 }
 
 func NewServer(
@@ -44,7 +46,11 @@ func NewServer(
 		Addr:              cfg.API.ListenAddr,
 		Handler:           handlerServer.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       cfg.API.ReadTimeout,
+		WriteTimeout:      cfg.API.WriteTimeout,
+		IdleTimeout:       cfg.API.IdleTimeout,
 	}
+	handlerServer.client = &http.Client{Timeout: cfg.API.RequestTimeout}
 
 	return handlerServer
 }
@@ -68,6 +74,8 @@ func (s *Server) Serve(ctx context.Context) error {
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
+	mux.HandleFunc("GET /readyz", s.readyz)
+	mux.HandleFunc("GET /bridge/status", s.bridgeStatus)
 	mux.HandleFunc("POST /devices/register", s.registerDevice)
 	mux.HandleFunc("POST /devices/{id}/token", s.issueToken)
 	mux.HandleFunc("GET /devices", s.listDevices)
@@ -78,11 +86,57 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /metrics/raw", s.metricsRaw)
 	mux.HandleFunc("GET /ws/telemetry", s.websocketTelemetry)
 
-	return s.cors(mux)
+	return chain(
+		mux,
+		s.requestID,
+		s.logging,
+		s.recoverer,
+		s.securityHeaders,
+		s.cors,
+		s.timeout,
+	)
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"service": "crabmq-api",
+	})
+}
+
+func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	checkCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	checks := map[string]string{
+		"database": "ok",
+		"bridge":   "ok",
+	}
+	statusCode := http.StatusOK
+
+	if err := s.store.Ping(checkCtx); err != nil {
+		checks["database"] = err.Error()
+		statusCode = http.StatusServiceUnavailable
+	}
+	if !s.bridge.Ready() {
+		checks["bridge"] = "bridge is not connected to broker"
+		statusCode = http.StatusServiceUnavailable
+	}
+
+	status := "ready"
+	if statusCode != http.StatusOK {
+		status = "degraded"
+	}
+
+	writeJSON(w, statusCode, map[string]any{
+		"status": status,
+		"checks": checks,
+		"bridge": s.bridge.Status(),
+	})
+}
+
+func (s *Server) bridgeStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.bridge.Status())
 }
 
 func (s *Server) registerDevice(w http.ResponseWriter, r *http.Request) {
@@ -91,14 +145,13 @@ func (s *Server) registerDevice(w http.ResponseWriter, r *http.Request) {
 		Name     string         `json:"name"`
 		Metadata map[string]any `json:"metadata"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &request, s.cfg.API.MaxBodyBytes); err != nil {
 		return
 	}
 
 	device, err := s.devices.Register(r.Context(), request.ID, request.Name, request.Metadata)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeServiceError(w, r, err)
 		return
 	}
 
@@ -108,7 +161,7 @@ func (s *Server) registerDevice(w http.ResponseWriter, r *http.Request) {
 func (s *Server) issueToken(w http.ResponseWriter, r *http.Request) {
 	token, err := s.devices.IssueToken(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeServiceError(w, r, err)
 		return
 	}
 
@@ -121,7 +174,7 @@ func (s *Server) issueToken(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
 	devices, err := s.devices.List(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeServiceError(w, r, err)
 		return
 	}
 
@@ -132,7 +185,7 @@ func (s *Server) deviceTelemetry(w http.ResponseWriter, r *http.Request) {
 	limit := parseLimit(r.URL.Query().Get("limit"), 50)
 	messages, err := s.devices.Telemetry(r.Context(), r.PathValue("id"), limit)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeServiceError(w, r, err)
 		return
 	}
 
@@ -140,18 +193,22 @@ func (s *Server) deviceTelemetry(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sendCommand(w http.ResponseWriter, r *http.Request) {
-	payload, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+	if err := services.ValidateDeviceID(r.PathValue("id")); err != nil {
+		writeServiceError(w, r, err)
 		return
 	}
-	if len(strings.TrimSpace(string(payload))) == 0 {
-		payload = []byte(`{}`)
+
+	var payload json.RawMessage
+	if err := decodeJSON(w, r, &payload, s.cfg.API.MaxBodyBytes); err != nil {
+		return
+	}
+	if len(bytes.TrimSpace(payload)) == 0 {
+		payload = json.RawMessage(`{}`)
 	}
 
 	packet, err := s.bridge.PublishCommand(r.Context(), r.PathValue("id"), payload)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, err)
+		writeServiceError(w, r, err)
 		return
 	}
 
@@ -162,7 +219,7 @@ func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {
 	limit := parseLimit(r.URL.Query().Get("limit"), 100)
 	messages, err := s.devices.Messages(r.Context(), limit)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeServiceError(w, r, err)
 		return
 	}
 
@@ -172,7 +229,7 @@ func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {
 func (s *Server) metricsSummary(w http.ResponseWriter, r *http.Request) {
 	summary, err := s.store.GetMetricsSummary(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeServiceError(w, r, err)
 		return
 	}
 
@@ -186,16 +243,20 @@ func (s *Server) metricsRaw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := http.DefaultClient.Do(request)
+	response, err := s.client.Do(request)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, err)
+		writeServiceError(w, r, err)
 		return
 	}
 	defer response.Body.Close()
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err)
+		writeServiceError(w, r, err)
+		return
+	}
+	if response.StatusCode >= http.StatusBadRequest {
+		writeError(w, http.StatusBadGateway, errors.New(strings.TrimSpace(string(body))))
 		return
 	}
 
@@ -208,25 +269,6 @@ func (s *Server) websocketTelemetry(w http.ResponseWriter, r *http.Request) {
 	s.bridge.Hub().ServeWS(w, r)
 }
 
-func (s *Server) cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" && (slices.Contains(s.cfg.API.AllowedOrigins, origin) || slices.Contains(s.cfg.API.AllowedOrigins, "*")) {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		}
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
 func parseLimit(value string, fallback int) int {
 	if value == "" {
 		return fallback
@@ -235,6 +277,9 @@ func parseLimit(value string, fallback int) int {
 	limit, err := strconv.Atoi(value)
 	if err != nil || limit <= 0 {
 		return fallback
+	}
+	if limit > 500 {
+		return 500
 	}
 
 	return limit
@@ -248,4 +293,43 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
+	writeError(w, statusForError(err), withRequestIDError(r, err))
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, target any, maxBodyBytes int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	defer r.Body.Close()
+
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeError(w, http.StatusBadRequest, errors.New("request body must contain a single JSON object"))
+		return err
+	}
+
+	return nil
+}
+
+func statusForError(err error) int {
+	switch {
+	case err == nil:
+		return http.StatusInternalServerError
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout
+	case strings.Contains(err.Error(), "not found"):
+		return http.StatusNotFound
+	case strings.Contains(err.Error(), "bridge is not connected"):
+		return http.StatusServiceUnavailable
+	case strings.Contains(err.Error(), "must") || strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "missing") || strings.Contains(err.Error(), "invalid"):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
 }

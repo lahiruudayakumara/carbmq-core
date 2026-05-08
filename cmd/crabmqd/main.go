@@ -18,7 +18,13 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid configuration: %v\n", err)
+		os.Exit(2)
+	}
+
 	logger := newLogger(cfg.Observability.LogLevel)
+	logger.Info("loaded configuration", "env", cfg.Env, "broker_addr", cfg.Broker.ListenAddr, "api_addr", cfg.API.ListenAddr)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

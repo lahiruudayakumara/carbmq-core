@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -26,11 +27,18 @@ type Hub struct {
 	logger   *slog.Logger
 }
 
-func NewHub(logger *slog.Logger) *Hub {
+func NewHub(logger *slog.Logger, allowedOrigins []string) *Hub {
 	return &Hub{
 		clients: make(map[*websocket.Conn]struct{}),
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(_ *http.Request) bool { return true },
+			CheckOrigin: func(r *http.Request) bool {
+				origin := r.Header.Get("Origin")
+				if origin == "" {
+					return true
+				}
+
+				return slices.Contains(allowedOrigins, "*") || slices.Contains(allowedOrigins, origin)
+			},
 		},
 		logger: logger,
 	}

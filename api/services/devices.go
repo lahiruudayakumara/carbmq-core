@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/opencorex/crabmq-core/api/db"
@@ -23,10 +24,23 @@ func NewDeviceService(store *db.Store, auth *authjwt.Service, tokenTTL time.Dura
 }
 
 func (s *DeviceService) Register(ctx context.Context, id string, name string, metadata map[string]any) (db.Device, error) {
+	if err := ValidateDeviceID(id); err != nil {
+		return db.Device{}, err
+	}
+
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = id
+	}
+
 	return s.store.RegisterDevice(ctx, id, name, metadata)
 }
 
 func (s *DeviceService) IssueToken(ctx context.Context, deviceID string) (string, error) {
+	if err := ValidateDeviceID(deviceID); err != nil {
+		return "", err
+	}
+
 	if _, err := s.store.GetDevice(ctx, deviceID); err != nil {
 		return "", err
 	}
@@ -39,6 +53,10 @@ func (s *DeviceService) List(ctx context.Context) ([]db.Device, error) {
 }
 
 func (s *DeviceService) Telemetry(ctx context.Context, deviceID string, limit int) ([]db.Message, error) {
+	if err := ValidateDeviceID(deviceID); err != nil {
+		return nil, err
+	}
+
 	return s.store.GetTelemetry(ctx, deviceID, limit)
 }
 
